@@ -2,23 +2,45 @@
 node_modules/
 package-lock.json
 yarn.lock
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # Environment variables
 .env
-.env.local
-.env.*.local
-.env.development
-.env.test
-.env.production
+
+# Database
+*.sqlite3
+*.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
 
 # Build outputs
 dist/
 build/
-out/
-*.pyc
-__pycache__/
-*.pyo
-*.pyd
+*.egg-info/
 
 # IDE and editor files
 .idea/
@@ -29,35 +51,38 @@ __pycache__/
 *.sublime-workspace
 *.sublime-project
 
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Testing
-coverage/
-.nyc_output/
-.pytest_cache/
-htmlcov/
-
 # Temporary files
 *.tmp
 *.temp
 .cache/
 .temp/
-venv/
-
-# System Files
-.DS_Store
-Thumbs.db
 
 # API documentation
 docs/_build/
 api-docs/
 
-# Misc
-*.bak
-*.backup
-.history/
+# Alembic migration versions
+# Comment this out if you want to track migrations in git
+# alembic/versions/*
+
+# Secrets and credentials
+*.pem
+*.key
+credentials.json
+secrets.yaml
+config.local.yaml
+
+# Monitoring files
+.prometheus
+.grafana
+
+# Docker and deployment
+.docker/
+docker-compose.override.yml
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Virtual environment
+.virtualenv

@@ -1,14 +1,23 @@
 from typing import Dict, List, Any, Optional
 import asyncio
 import time
+import logging
 from datetime import datetime
 import json
 
+from sqlalchemy.orm import Session
+
+from app.db.repositories.job_repository import JobRepository
 from app.models.batch import BatchStatus
 from app.models.results import BatchResults, TestResult, TurnResult, ValidationResult
 from app.services.agent import AgentService
 from app.services.validation import ValidationService
 from app.services.scraper import ScraperService
+from app.db.session import SessionLocal
+from app.core.metrics import record_test_execution, record_validation_execution, record_api_latency
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class ExecutionService:
@@ -16,72 +25,106 @@ class ExecutionService:
         self.agent_service = AgentService()
         self.validation_service = ValidationService()
         self.scraper_service = ScraperService()
-        
-        # In-memory storage for job status and results
-        # In production, use Redis or a database
-        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.job_repository = JobRepository()
     
     async def execute_batch(self, job_id: str, batch_id: str, tests: List[Dict[str, Any]]) -> None:
         """
         Execute a batch of tests asynchronously.
         """
-        # Initialize job status
-        self.jobs[job_id] = {
-            "batch_id": batch_id,
-            "status": "running",
-            "started_at": datetime.utcnow().isoformat(),
-            "completed_at": None,
-            "total_tests": len(tests),
-            "completed_tests": 0,
-            "failed_tests": 0,
-            "current_test_id": None,
-            "current_turn": None,
-            "progress": 0,
-            "results": {}
-        }
+        # Create a new database session for this async task
+        db = SessionLocal()
         
         try:
+            # Initialize job in the database
+            logger.info(f"Starting batch execution: job_id={job_id}, batch_id={batch_id}, tests={len(tests)}")
+            self.job_repository.create_job(db, job_id, batch_id, len(tests))
+            self.job_repository.update_job_status(db, job_id, "running")
+            
             for test in tests:
-                test_id = test["test_id"]
+                test_id = test.test_id
                 
                 # Update job status
-                self.jobs[job_id]["current_test_id"] = test_id
-                self.jobs[job_id]["current_turn"] = 0
+                logger.info(f"Processing test: job_id={job_id}, test_id={test_id}")
+                self.job_repository.update_job_status(
+                    db, 
+                    job_id, 
+                    "running",
+                    current_test_id=test_id,
+                    current_turn=0
+                )
                 
                 # Initialize test result
-                self.jobs[job_id]["results"][test_id] = {
-                    "test_id": test_id,
-                    "status": "running",
-                    "started_at": datetime.utcnow().isoformat(),
-                    "completed_at": None,
-                    "turn_results": []
-                }
+                test_result = self.job_repository.create_test_result(db, job_id, test_id)
                 
                 try:
                     # Start agent session
                     session_id = await self.agent_service.start_session(
-                        test_id, test["credentials"]
+                        test_id, test.credentials
                     )
                     
+                    # Record test execution start in metrics
+                    record_test_execution(test_id, "started")
+                    
                     # Process each turn
-                    for turn in test["turns"]:
+                    response_times = []
+                    for turn in test.turns:
                         # Update job status
-                        self.jobs[job_id]["current_turn"] = turn["order"]
+                        self.job_repository.update_job_status(
+                            db, 
+                            job_id, 
+                            "running",
+                            current_turn=turn["order"]
+                        )
                         
                         # Send message to agent
                         start_time = time.time()
-                        agent_response = await self.agent_service.send_message(
-                            session_id, turn["user_input"]
-                        )
+                        
+                        # Add retry logic for agent communication
+                        agent_response = None
+                        max_retries = 3
+                        retry_count = 0
+                        
+                        while retry_count < max_retries:
+                            try:
+                                # Record API call latency
+                                with record_api_latency("agent_message"):
+                                    agent_response = await self.agent_service.send_message(
+                                        session_id, turn["user_input"]
+                                    )
+                                break
+                            except Exception as e:
+                                retry_count += 1
+                                logger.warning(f"Retry {retry_count}/{max_retries} - Error sending message to agent: {str(e)}")
+                                if retry_count >= max_retries:
+                                    raise
+                                await asyncio.sleep(1)  # Wait before retrying
+                        
                         response_time_ms = int((time.time() - start_time) * 1000)
+                        response_times.append(response_time_ms)
                         
                         # Extract URLs and scrape content if any
                         scraped_content = None
                         urls = self.scraper_service.extract_urls(agent_response)
                         if urls:
-                            scraped_content = await self.scraper_service.scrape_urls(
-                                urls, test.get("config", {}).get("html_selector")
-                            )
+                            try:
+                                with record_api_latency("web_scraping"):
+                                    scraped_content = await self.scraper_service.scrape_urls(
+                                        urls, test.get("config", {}).get("html_selector")
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Error scraping content: {str(e)}")
+                                
+                        # Create turn result in database
+                        turn_result = self.job_repository.create_turn_result(
+                            db,
+                            test_result.id,
+                            turn["turn_id"],
+                            turn["order"],
+                            turn["user_input"],
+                            agent_response,
+                            scraped_content,
+                            response_time_ms
+                        )
                         
                         # Process validations
                         validation_results = []
@@ -94,187 +137,132 @@ class ExecutionService:
                                 scraped_content
                             )
                             
-                            # Validate the response
-                            result = await self.validation_service.validate(
+                            # Validate the response with retry logic
+                            validation_result = None
+                            retry_count = 0
+                            
+                            while retry_count < max_retries:
+                                try:
+                                    # Record validation execution in metrics
+                                    with record_api_latency("validation"):
+                                        validation_result = await self.validation_service.validate(
+                                            validation["validation_type"],
+                                            agent_response,
+                                            params
+                                        )
+                                    break
+                                except Exception as e:
+                                    retry_count += 1
+                                    logger.warning(f"Retry {retry_count}/{max_retries} - Error validating response: {str(e)}")
+                                    if retry_count >= max_retries:
+                                        # Create a failure result
+                                        validation_result = {
+                                            "passed": False,
+                                            "score": 0.0,
+                                            "details": f"Validation failed after {max_retries} retries: {str(e)}"
+                                        }
+                                    else:
+                                        await asyncio.sleep(1)  # Wait before retrying
+                            
+                            is_passed = validation_result.get("passed", False)
+                            if is_passed:
+                                passed_validations += 1
+                                
+                            # Record validation result in database
+                            self.job_repository.create_validation_result(
+                                db,
+                                turn_result.id,
+                                validation["validation_id"],
                                 validation["validation_type"],
-                                agent_response,
-                                params
+                                is_passed,
+                                validation_result.get("score"),
+                                validation_result
                             )
                             
-                            if result.get("passed", False):
-                                passed_validations += 1
-                            
-                            validation_results.append({
-                                "validation_id": validation["validation_id"],
-                                "validation_type": validation["validation_type"],
-                                "is_passed": result.get("passed", False),
-                                "score": result.get("score"),
-                                "details": result
-                            })
-                        
-                        # Record turn result
-                        turn_result = {
-                            "turn_id": turn["turn_id"],
-                            "order": turn["order"],
-                            "user_input": turn["user_input"],
-                            "agent_response": agent_response,
-                            "scraped_content": scraped_content,
-                            "response_time_ms": response_time_ms,
-                            "validations_total": len(validation_results),
-                            "validations_passed": passed_validations,
-                            "validations_failed": len(validation_results) - passed_validations,
-                            "validation_results": validation_results
-                        }
-                        
-                        self.jobs[job_id]["results"][test_id]["turn_results"].append(turn_result)
+                            # Record metric for validation
+                            record_validation_execution(
+                                validation["validation_type"], 
+                                "success" if is_passed else "failure"
+                            )
                     
                     # End agent session
                     await self.agent_service.end_session(session_id)
                     
-                    # Mark test as completed
-                    self.jobs[job_id]["results"][test_id]["status"] = "completed"
-                    self.jobs[job_id]["results"][test_id]["completed_at"] = datetime.utcnow().isoformat()
-                    self.jobs[job_id]["completed_tests"] += 1
+                    # Calculate average response time
+                    avg_response_time = sum(response_times) / len(response_times) if response_times else 0
+                    
+                    # Update test result
+                    self.job_repository.update_test_result(
+                        db,
+                        test_result.id,
+                        "completed",
+                        avg_response_time=avg_response_time
+                    )
+                    
+                    # Record test execution completion in metrics
+                    record_test_execution(test_id, "completed")
+                    
+                    # Update job completed tests count
+                    completed_tests = self.job_repository.get_job(db, job_id).completed_tests or 0
+                    self.job_repository.update_job_status(
+                        db,
+                        job_id,
+                        "running",
+                        completed_tests=completed_tests + 1
+                    )
                     
                 except Exception as e:
+                    # Log the error
+                    logger.error(f"Error executing test {test_id}: {str(e)}", exc_info=True)
+                    
                     # Mark test as failed
-                    self.jobs[job_id]["results"][test_id]["status"] = "failed"
-                    self.jobs[job_id]["results"][test_id]["completed_at"] = datetime.utcnow().isoformat()
-                    self.jobs[job_id]["results"][test_id]["error"] = str(e)
-                    self.jobs[job_id]["failed_tests"] += 1
-                
-                # Update progress
-                total = self.jobs[job_id]["total_tests"]
-                completed = self.jobs[job_id]["completed_tests"] + self.jobs[job_id]["failed_tests"]
-                self.jobs[job_id]["progress"] = int((completed / total) * 100) if total > 0 else 0
+                    self.job_repository.update_test_result(
+                        db,
+                        test_result.id,
+                        "failed",
+                        error=str(e)
+                    )
+                    
+                    # Record test execution failure in metrics
+                    record_test_execution(test_id, "failed")
+                    
+                    # Update job failed tests count
+                    failed_tests = self.job_repository.get_job(db, job_id).failed_tests or 0
+                    self.job_repository.update_job_status(
+                        db,
+                        job_id,
+                        "running",
+                        failed_tests=failed_tests + 1
+                    )
             
             # Mark job as completed
-            self.jobs[job_id]["status"] = "completed"
-            self.jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            self.jobs[job_id]["current_test_id"] = None
-            self.jobs[job_id]["current_turn"] = None
+            self.job_repository.update_job_status(db, job_id, "completed")
+            logger.info(f"Batch execution completed: job_id={job_id}")
             
         except Exception as e:
+            # Log the error
+            logger.error(f"Error executing batch {job_id}: {str(e)}", exc_info=True)
+            
             # Mark job as failed
-            self.jobs[job_id]["status"] = "failed"
-            self.jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            self.jobs[job_id]["error"] = str(e)
+            self.job_repository.update_job_status(db, job_id, "failed", error=str(e))
+        
+        finally:
+            # Close the database session
+            db.close()
     
     def get_batch_status(self, job_id: str) -> Optional[BatchStatus]:
         """
         Get the status of a batch execution.
         """
-        job = self.jobs.get(job_id)
-        if not job:
-            return None
-        
-        return BatchStatus(
-            job_id=job_id,
-            batch_id=job["batch_id"],
-            status=job["status"],
-            started_at=job["started_at"],
-            completed_at=job["completed_at"],
-            progress=job["progress"],
-            total_tests=job["total_tests"],
-            completed_tests=job["completed_tests"],
-            failed_tests=job["failed_tests"],
-            current_test_id=job["current_test_id"],
-            current_turn=job["current_turn"],
-            error=job.get("error")
-        )
+        with SessionLocal() as db:
+            return self.job_repository.get_batch_status(db, job_id)
     
     def get_batch_results(self, job_id: str, include_scraped_content: bool = False) -> Optional[BatchResults]:
         """
         Get the complete results for a batch execution.
         """
-        job = self.jobs.get(job_id)
-        if not job:
-            return None
-        
-        # Calculate overall metrics
-        total_validations = 0
-        passed_validations = 0
-        failed_validations = 0
-        response_times = []
-        
-        test_results = []
-        for test_id, test_data in job["results"].items():
-            # Calculate test metrics
-            test_validations = 0
-            test_passed_validations = 0
-            test_response_times = []
-            
-            turn_results = []
-            for turn_data in test_data.get("turn_results", []):
-                # Skip scraped content if not requested
-                if not include_scraped_content:
-                    turn_data = {**turn_data, "scraped_content": None}
-                
-                test_validations += turn_data.get("validations_total", 0)
-                test_passed_validations += turn_data.get("validations_passed", 0)
-                
-                if turn_data.get("response_time_ms"):
-                    test_response_times.append(turn_data["response_time_ms"])
-                
-                turn_results.append(TurnResult(**turn_data))
-            
-            # Update overall metrics
-            total_validations += test_validations
-            passed_validations += test_passed_validations
-            failed_validations += test_validations - test_passed_validations
-            response_times.extend(test_response_times)
-            
-            # Calculate test pass rate
-            test_pass_rate = 0
-            if test_validations > 0:
-                test_pass_rate = (test_passed_validations / test_validations) * 100
-            
-            # Calculate average response time
-            avg_response_time = 0
-            if test_response_times:
-                avg_response_time = sum(test_response_times) / len(test_response_times)
-            
-            test_results.append(TestResult(
-                test_id=test_id,
-                status=test_data["status"],
-                started_at=test_data["started_at"],
-                completed_at=test_data.get("completed_at"),
-                error=test_data.get("error"),
-                total_validations=test_validations,
-                passed_validations=test_passed_validations,
-                failed_validations=test_validations - test_passed_validations,
-                pass_rate=test_pass_rate,
-                avg_response_time=avg_response_time,
-                turn_results=turn_results
-            ))
-        
-        # Calculate overall pass rate
-        overall_pass_rate = 0
-        if total_validations > 0:
-            overall_pass_rate = (passed_validations / total_validations) * 100
-        
-        # Calculate overall average response time
-        overall_avg_response_time = 0
-        if response_times:
-            overall_avg_response_time = sum(response_times) / len(response_times)
-        
-        return BatchResults(
-            job_id=job_id,
-            batch_id=job["batch_id"],
-            status=job["status"],
-            started_at=job["started_at"],
-            completed_at=job["completed_at"],
-            total_tests=job["total_tests"],
-            completed_tests=job["completed_tests"],
-            failed_tests=job["failed_tests"],
-            total_validations=total_validations,
-            passed_validations=passed_validations,
-            failed_validations=failed_validations,
-            pass_rate=overall_pass_rate,
-            avg_response_time=overall_avg_response_time,
-            test_results=test_results,
-            error=job.get("error")
-        )
+        with SessionLocal() as db:
+            return self.job_repository.get_batch_results(db, job_id, include_scraped_content)
     
     def _update_validation_params(
         self, 
